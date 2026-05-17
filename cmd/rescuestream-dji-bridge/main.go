@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"alpineworks.io/ootel"
+	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/archive"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/cloudapi/correlation"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/cloudapi/topic"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/config"
@@ -68,6 +69,25 @@ func run() error {
 	tracker := correlation.New(logger)
 	router := topic.NewRouter(logger)
 
+	// Telemetry archive (optional) — persists all downlinked telemetry to
+	// Postgres for playback. Created before the MQTT client so its deferred
+	// Close runs after the MQTT disconnect (no telemetry enqueued mid-flush).
+	var archiveWriter *archive.Writer
+	if c.DatabaseURL != "" {
+		archiveWriter = archive.New(c.DatabaseURL, archive.WithLogger(logger))
+		if err := archiveWriter.Connect(ctx); err != nil {
+			return fmt.Errorf("connect telemetry archive: %w", err)
+		}
+		defer func() {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			archiveWriter.Close(closeCtx)
+		}()
+		logger.Info("telemetry archive connected")
+	} else {
+		logger.Warn("DATABASE_URL not set — telemetry persistence disabled")
+	}
+
 	// MQTT client — built before handlers so handlers can publish replies
 	// through it; it routes every inbound message to the router.
 	mqttClient, err := mqtt.New(c.MQTTBrokerURL,
@@ -86,16 +106,16 @@ func run() error {
 
 	// Handlers — P0 topology + P1 telemetry; command replies route to the
 	// correlation tracker.
-	router.Handle(topic.SuffixStatus, "update_topo", handler.NewTopology(registry, mqttClient, logger))
+	router.Handle(topic.SuffixStatus, "update_topo", handler.NewTopology(registry, mqttClient, archiveWriter, logger))
 	router.HandleSuffix(topic.SuffixRequests, handler.NewRequests(handler.DJICredentials{
 		AppID:         c.DJIAppID,
 		AppKey:        c.DJIAppKey,
 		License:       c.DJILicense,
 		NTPServerHost: c.NTPServerHost,
 	}, mqttClient, logger))
-	router.HandleSuffix(topic.SuffixOSD, handler.NewOSD(registry, store, logger))
-	router.HandleSuffix(topic.SuffixState, handler.NewState(registry, store, mqttClient, logger))
-	router.HandleSuffix(topic.SuffixEvents, handler.NewEvents(mqttClient, logger))
+	router.HandleSuffix(topic.SuffixOSD, handler.NewOSD(registry, store, archiveWriter, logger))
+	router.HandleSuffix(topic.SuffixState, handler.NewState(registry, store, mqttClient, archiveWriter, logger))
+	router.HandleSuffix(topic.SuffixEvents, handler.NewEvents(mqttClient, archiveWriter, logger))
 	router.HandleSuffix(topic.SuffixDRCUp, handler.NewDRC(logger))
 	router.HandleSuffix(topic.SuffixServicesReply, tracker)
 

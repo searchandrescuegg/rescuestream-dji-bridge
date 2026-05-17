@@ -37,6 +37,10 @@ type Config struct {
 	JWTPrivateKeyFile string        `env:"JWT_PRIVATE_KEY_FILE"`
 	JWTTTL            time.Duration `env:"JWT_TTL" envDefault:"1h"`
 
+	// Telemetry persistence — Postgres/Neon connection string. When set, all
+	// downlinked telemetry is archived for playback; empty runs in-memory-only.
+	DatabaseURL string `env:"DATABASE_URL"`
+
 	// DJI developer credentials — injected into the onboarding WebView page and
 	// returned in the MQTT `config` reply, which the device's cloud module uses
 	// to verify the Cloud API license (gates the whole connection).

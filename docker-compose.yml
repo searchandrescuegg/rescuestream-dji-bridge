@@ -12,10 +12,28 @@ services:
       timeout: 5s
       retries: 20
 
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: rescuestream
+      POSTGRES_PASSWORD: rescuestream
+      POSTGRES_DB: rescuestream
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rescuestream"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   main:
     build: .
     depends_on:
       emqx:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     ports:
       - "8080:8080" # onboarding + telemetry API
@@ -40,6 +58,10 @@ services:
       MQTT_BROKER_URL: "mqtt://emqx:1883"
       MQTT_PUBLIC_HOST: "${MQTT_PUBLIC_HOST:-tcp://localhost:1883}"
       JWT_PRIVATE_KEY_FILE: "/keys/jwt-private.pem"
+
+      # telemetry persistence — defaults to the local postgres service;
+      # set DATABASE_URL in .env to archive to Neon instead.
+      DATABASE_URL: "${DATABASE_URL:-postgres://rescuestream:rescuestream@postgres:5432/rescuestream?sslmode=disable}"
 
       # dji onboarding — set DJI_* and WORKSPACE_ID in .env for real hardware
       DJI_APP_ID: "${DJI_APP_ID:-}"
@@ -88,3 +110,6 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
+
+volumes:
+  postgres-data:

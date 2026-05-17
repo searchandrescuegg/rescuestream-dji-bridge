@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/archive"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/cloudapi/message"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/cloudapi/topic"
 	"github.com/searchandrescuegg/rescuestream-dji-bridge/internal/device"
@@ -29,16 +30,17 @@ type topologyData struct {
 }
 
 // Topology handles sys/product/{rc}/status update_topo messages: it records the
-// RC Plus <-> aircraft mapping and acks on status_reply (§5.3).
+// RC Plus <-> aircraft mapping, archives it, and acks on status_reply (§5.3).
 type Topology struct {
 	registry *device.Registry
 	pub      Publisher
+	archive  *archive.Writer
 	logger   *slog.Logger
 }
 
-// NewTopology creates a topology handler.
-func NewTopology(registry *device.Registry, pub Publisher, logger *slog.Logger) *Topology {
-	return &Topology{registry: registry, pub: pub, logger: logger}
+// NewTopology creates a topology handler. arc may be nil (persistence off).
+func NewTopology(registry *device.Registry, pub Publisher, arc *archive.Writer, logger *slog.Logger) *Topology {
+	return &Topology{registry: registry, pub: pub, archive: arc, logger: logger}
 }
 
 // Handle implements topic.Handler.
@@ -49,12 +51,17 @@ func (h *Topology) Handle(ctx context.Context, t topic.Topic, env *message.Envel
 	}
 	h.registry.ApplyTopology(t.SN, data.Type, data.SubType, data.SubDevices)
 
-	if len(data.SubDevices) == 0 {
-		h.logger.Info("topology updated: aircraft offline", slog.String("rc_sn", t.SN))
-	} else {
+	online := len(data.SubDevices) > 0
+	aircraftSN := ""
+	if online {
+		aircraftSN = data.SubDevices[0].SN
 		h.logger.Info("topology updated",
-			slog.String("rc_sn", t.SN),
-			slog.String("aircraft_sn", data.SubDevices[0].SN))
+			slog.String("rc_sn", t.SN), slog.String("aircraft_sn", aircraftSN))
+	} else {
+		h.logger.Info("topology updated: aircraft offline", slog.String("rc_sn", t.SN))
+	}
+	if h.archive != nil {
+		h.archive.Topology(t.SN, aircraftSN, online, env.Timestamp, env.Data)
 	}
 
 	reply, err := env.Reply(map[string]any{"result": 0})
