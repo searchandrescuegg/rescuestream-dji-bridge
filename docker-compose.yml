@@ -61,7 +61,8 @@ services:
 
       # telemetry persistence — defaults to the local postgres service;
       # set DATABASE_URL in .env to archive to Neon instead.
-      DATABASE_URL: "${DATABASE_URL:-postgres://rescuestream:rescuestream@postgres:5432/rescuestream?sslmode=disable}"
+      DATABASE_URL: "${DATABASE_URL:-postgres://rescuestream:rescuestream@\
+        postgres:5432/rescuestream?sslmode=disable}"
 
       # dji onboarding — set DJI_* and WORKSPACE_ID in .env for real hardware
       DJI_APP_ID: "${DJI_APP_ID:-}"
