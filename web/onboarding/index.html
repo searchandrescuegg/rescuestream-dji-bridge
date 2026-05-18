@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RescueStream — RC Plus Onboarding</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 1.5rem;
+    font: 16px/1.5 -apple-system, system-ui, sans-serif;
+    background: #0e1116; color: #e6e6e6;
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  #summary { color: #9aa4b2; margin: 0 0 1rem; }
+  ol { margin: 0; padding-left: 1.25rem; }
+  li { margin: .35rem 0; }
+  li.ok::marker { content: "✓ "; color: #3fb950; }
+  li.err::marker { content: "✗ "; color: #f85149; }
+  li.err { color: #f85149; }
+  button {
+    margin-top: 1rem; padding: .6rem 1.1rem; font-size: 1rem;
+    background: #2f81f7; color: #fff; border: 0; border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+<h1>RescueStream</h1>
+<p id="summary">Connecting the RC Plus to RescueStream…</p>
+<ol id="log"></ol>
+<button id="retry" hidden onclick="onboard()">Retry</button>
+<!-- vConsole: on-device debug console (console logs, network, errors). -->
+<script src="/vconsole.min.js"></script>
+<script>if (window.VConsole) { new window.VConsole(); }</script>
+<script>
+  const cfg = {
+    appId: "{{.AppID}}",
+    appKey: "{{.AppKey}}",
+    license: "{{.License}}",
+    platformName: "{{.PlatformName}}",
+    workspaceId: "{{.WorkspaceID}}",
+  };
+
+  // The API key, if any, is carried in this page's own URL (?key=...) and
+  // forwarded to the backend onboarding call.
+  const apiKey = new URLSearchParams(location.search).get("key") || "";
+
+  // Whether the thing module has reported a successful broker connection.
+  let thingConnected = false;
+
+  function log(msg, ok) {
+    console.log("[onboard] " + msg);
+    const li = document.createElement("li");
+    li.textContent = msg;
+    li.className = ok ? "ok" : "err";
+    document.getElementById("log").appendChild(li);
+  }
+
+  function fail(msg) {
+    log(msg, false);
+    document.getElementById("summary").textContent = "Onboarding failed.";
+    document.getElementById("retry").hidden = false;
+  }
+
+  // Every JSBridge call returns a JSON string; code:0 means success (§5.1).
+  function parse(res) {
+    try { return JSON.parse(res); } catch (e) { return { code: -1, message: String(res) }; }
+  }
+
+  async function onboard() {
+    document.getElementById("log").replaceChildren();
+    document.getElementById("retry").hidden = true;
+    thingConnected = false;
+    document.getElementById("summary").textContent = "Connecting the RC Plus to RescueStream…";
+
+    const b = window.djiBridge;
+    if (!b) { fail("djiBridge unavailable — open this page inside DJI Pilot 2"); return; }
+
+    // 1. Verify the developer license before any other JSBridge call.
+    let r = parse(b.platformVerifyLicense(cfg.appId, cfg.appKey, cfg.license));
+    if (r.code !== 0) { fail("license verify failed: " + (r.message || r.code)); return; }
+    if (!parse(b.platformIsVerified()).data) { fail("license not verified"); return; }
+    log("license verified", true);
+
+    // 2-3. Set the cloud portal labels and workspace identifier.
+    let info = parse(b.platformSetInformation(cfg.platformName,
+      cfg.platformName + " Workspace", "Search & Rescue cloud platform"));
+    if (info.code !== 0) { fail("platformSetInformation failed: " + (info.message || info.code)); return; }
+    let ws = parse(b.platformSetWorkspaceId(cfg.workspaceId));
+    if (ws.code !== 0) { fail("platformSetWorkspaceId failed: " + (ws.message || ws.code)); return; }
+    log("platform information set", true);
+
+    // 4. Read the RC Plus and aircraft serial numbers.
+    const rcSN = parse(b.platformGetRemoteControllerSN()).data;
+    const aircraftSN = parse(b.platformGetAircraftSN()).data;
+    if (!rcSN) { fail("could not read RC Plus serial number"); return; }
+    log("RC Plus " + rcSN + ", aircraft " + (aircraftSN || "(offline)"), true);
+
+    // 5. Ask our backend for broker host + per-device credentials.
+    let creds;
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (apiKey) headers["X-API-Key"] = apiKey;
+      const resp = await fetch("/api/onboard", {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify({ rc_sn: rcSN, aircraft_sn: aircraftSN || "" }),
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      creds = await resp.json();
+    } catch (e) {
+      fail("backend onboarding failed: " + e.message);
+      return;
+    }
+    log("received broker credentials", true);
+
+    // 6. Load the cloud ("thing") module — the RC Plus connects to our broker.
+    r = parse(b.platformLoadComponent("thing", JSON.stringify({
+      host: creds.host,
+      username: creds.username,
+      password: creds.password,
+      connectCallback: "onThingConnect",
+    })));
+    if (r.code !== 0) { fail("loadComponent failed: " + (r.message || r.code)); return; }
+    log("cloud module loaded — connecting to broker…", true);
+
+    // The broker connection is reported asynchronously via onThingConnect.
+    // Only surface a problem if it never connects.
+    setTimeout(function () {
+      if (!thingConnected) {
+        document.getElementById("summary").textContent =
+          "Broker connection is taking longer than expected.";
+        document.getElementById("retry").hidden = false;
+      }
+    }, 30000);
+  }
+
+  // connectCallback is a CONNECTION-STATE notifier: the thing module calls it
+  // with `false` while connecting and `true` once connected (and again on a
+  // later drop/reconnect). A `false` before the first `true` is the normal
+  // "connecting" state — NOT an onboarding failure — so it must not fail the
+  // page, or the operator backs out and cancels the signup.
+  window.onThingConnect = function (res) {
+    console.log("[onboard] connectCallback: " + JSON.stringify(res));
+    let ok = false;
+    try {
+      const r = (typeof res === "string") ? JSON.parse(res) : res;
+      ok = r === true ||
+        (r && (r.code === 0 || r.data === true ||
+          (r.data && r.data.connected === true)));
+    } catch (e) {
+      ok = (res === true || res === "true");
+    }
+    if (ok) {
+      if (!thingConnected) {
+        thingConnected = true;
+        log("RC Plus connected to RescueStream", true);
+      }
+      document.getElementById("summary").textContent =
+        "Connected — onboarding complete. You can return to Pilot.";
+      document.getElementById("retry").hidden = true;
+    } else if (!thingConnected) {
+      document.getElementById("summary").textContent = "Connecting to the broker…";
+    }
+  };
+
+  document.addEventListener("DOMContentLoaded", onboard);
+</script>
+</body>
+</html>

@@ -1,29 +1,102 @@
 ---
 services:
+  emqx:
+    image: emqx/emqx:5.8.8
+    ports:
+      - "1883:1883"   # MQTT
+      - "8883:8883"   # MQTT over TLS
+      - "18083:18083" # EMQX dashboard
+    healthcheck:
+      test: ["CMD", "emqx", "ctl", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: rescuestream
+      POSTGRES_PASSWORD: rescuestream
+      POSTGRES_DB: rescuestream
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rescuestream"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   main:
     build: .
+    depends_on:
+      emqx:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
-      - "8081:8081"
+      - "8080:8080" # onboarding + telemetry API
+      - "8081:8081" # metrics
+    volumes:
+      - ./docker/keys:/keys:ro
     environment:
       # logging
-      LOG_LEVEL: "info"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+
+      # http api
+      HTTP_PORT: "8080"
+      API_KEY: "${API_KEY:-dev-integration-key}"
+      SN_ALLOWLIST: "${SN_ALLOWLIST:-RC-MOCK-0001}"
 
       # metrics
       METRICS_ENABLED: "true"
       METRICS_PORT: "8081"
-
       LOCAL: "true"
+
+      # mqtt
+      MQTT_BROKER_URL: "mqtt://emqx:1883"
+      MQTT_PUBLIC_HOST: "${MQTT_PUBLIC_HOST:-tcp://localhost:1883}"
+      JWT_PRIVATE_KEY_FILE: "/keys/jwt-private.pem"
+
+      # telemetry persistence — defaults to the local postgres service;
+      # set DATABASE_URL in .env to archive to Neon instead.
+      DATABASE_URL: "${DATABASE_URL:-postgres://rescuestream:rescuestream@\
+        postgres:5432/rescuestream?sslmode=disable}"
+
+      # dji onboarding — set DJI_* and WORKSPACE_ID in .env for real hardware
+      DJI_APP_ID: "${DJI_APP_ID:-}"
+      DJI_APP_KEY: "${DJI_APP_KEY:-}"
+      DJI_LICENSE: "${DJI_LICENSE:-}"
+      PLATFORM_NAME: "RescueStream"
+      WORKSPACE_ID: "${WORKSPACE_ID:-00000000-0000-0000-0000-000000000000}"
 
       # tracing
       TRACING_ENABLED: "false"
       TRACING_SAMPLERATE: "1.0"
-      TRACING_SERVICE: "go-start"
+      TRACING_SERVICE: "rescuestream-dji-bridge"
       TRACING_VERSION: "0.0.1"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://lgtm:4317"
 
       # grpc (otlp tracing)
       GRPC_GO_LOG_VERBOSITY_LEVEL: 99
       GRPC_GO_LOG_SEVERITY_LEVEL: info
+
+  # mock-rcplus simulates an RC Plus + M30T. Off by default; enable with
+  # `docker compose --profile mock up`.
+  mock-rcplus:
+    build: .
+    command: ["/mock-rcplus"]
+    profiles: ["mock"]
+    depends_on:
+      - main
+    environment:
+      ONBOARD_URL: "http://main:8080/api/onboard"
+      API_KEY: "${API_KEY:-dev-integration-key}"
+      BROKER_URL: "mqtt://emqx:1883"
+      RC_SN: "RC-MOCK-0001"
+      AIRCRAFT_SN: "M30T-MOCK-0001"
+      OSD_INTERVAL: "1s"
 
   lgtm:
     image: grafana/otel-lgtm
@@ -38,3 +111,6 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
+
+volumes:
+  postgres-data:

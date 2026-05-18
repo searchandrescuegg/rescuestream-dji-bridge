@@ -1,65 +1,121 @@
-# go-start
+# rescuestream-dji-bridge
 
-A template repository for Go projects with built-in observability support.
+A Go service that bridges a DJI Matrice 30T flown on a DJI RC Plus to a
+self-hosted cloud platform over the DJI **pilot-to-cloud Cloud API (MQTT 5.0)**.
 
-## Features
+`m30t-rcplus-cloud-mvp.md` is the design document; the authoritative wire
+protocol is the DJI [`Cloud-API-Doc`](https://github.com/dji-sdk/Cloud-API-Doc)
+repository.
 
-- Structured JSON logging with configurable log levels via [slog](https://pkg.go.dev/log/slog)
-- OpenTelemetry metrics and tracing via [ootel](https://alpineworks.io/ootel)
-- Runtime and host metrics instrumentation
-- Environment-based configuration via [env](https://github.com/caarlos0/env)
-- Multi-stage Docker build with distroless final image
-- Local development setup with Grafana LGTM stack
+## What it does
+
+- **Onboarding** — serves the JSBridge page DJI Pilot 2 loads in its WebView and
+  issues per-device, short-lived RS256 JWT credentials for the broker.
+- **Topology** — learns the RC Plus ⇄ M30T pairing from `update_topo`.
+- **Telemetry** — ingests live M30T OSD/state, exposed as JSON and an SSE stream.
+- **Live streaming & DRC** — P2/P3 scaffolding is in place (`cloudapi/live`,
+  `cloudapi/drc`); full behavior is future work.
+
+MVP phases: **P0** onboarding/connect and **P1** telemetry are implemented;
+**P2** live streaming and **P3** DRC payload control are stubs.
+
+## HTTP endpoints
+
+Every endpoint is gated by `API_KEY` when one is configured (`X-API-Key` header,
+`Authorization: Bearer`, or `?key=` query parameter).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /` | JSBridge onboarding page (loaded inside DJI Pilot 2) |
+| `POST /api/onboard` | Issue MQTT broker host + per-device credentials |
+| `GET /api/devices` | Latest telemetry snapshot for every device |
+| `GET /api/devices/stream` | Server-Sent Events stream of telemetry updates |
 
 ## Configuration
 
-Configuration is managed through environment variables:
+Configuration is environment-variable based ([env](https://github.com/caarlos0/env)):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LOG_LEVEL` | Logging level (debug, info, warn, error) | `error` |
+| `LOG_LEVEL` | Logging level (debug, info, warn, error) | `info` |
+| `HTTP_PORT` | Onboarding/telemetry HTTP port | `8080` |
+| `API_KEY` | API key required on every HTTP endpoint; empty = open (dev only) | - |
+| `SN_ALLOWLIST` | Comma-separated RC Plus serials allowed to onboard; empty = any | - |
+| `MQTT_BROKER_URL` | Broker the bridge connects to (`mqtt://` or `tls://`) | `mqtt://localhost:1883` |
+| `MQTT_PUBLIC_HOST` | Broker host returned to devices (`tcp://`/`ws://` only) | `tcp://localhost:8883` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | Bridge's own broker credentials | - |
+| `MQTT_CA_CERT_FILE` | PEM CA bundle to trust for broker TLS | - |
+| `JWT_PRIVATE_KEY_FILE` | RSA private key for minting device credentials | - |
+| `JWT_TTL` | Lifetime of minted device tokens | `1h` |
+| `DJI_APP_ID` / `DJI_APP_KEY` / `DJI_LICENSE` | DJI developer credentials for JSBridge | - |
+| `PLATFORM_NAME` | Cloud portal name shown in Pilot 2 | `RescueStream` |
+| `WORKSPACE_ID` | Workspace UUID (tenant identifier) | - |
 | `METRICS_ENABLED` | Enable Prometheus metrics | `true` |
-| `METRICS_PORT` | Port for metrics endpoint | `8081` |
-| `LOCAL` | Use OTLP gRPC exporter instead of Prometheus | `false` |
+| `METRICS_PORT` | Port for the metrics endpoint | `8081` |
+| `LOCAL` | Use the OTLP gRPC exporter instead of Prometheus | `false` |
 | `TRACING_ENABLED` | Enable distributed tracing | `false` |
 | `TRACING_SAMPLERATE` | Trace sampling rate | `0.01` |
-| `TRACING_SERVICE` | Service name for traces | `katalog-agent` |
+| `TRACING_SERVICE` | Service name for traces | `rescuestream-dji-bridge` |
 | `TRACING_VERSION` | Service version for traces | - |
 
 ## Getting Started
 
-### Run Locally with Docker Compose
+### Run the local stack
 
 ```bash
-docker-compose up
+make certs          # generate the JWT keypair + a self-signed TLS cert
+docker compose up    # EMQX broker + bridge + Grafana LGTM
 ```
 
-This starts the application along with the Grafana LGTM (Loki, Grafana, Tempo, Mimir) stack for local observability:
+- **Onboarding/telemetry API**: http://localhost:8080
+- **EMQX dashboard**: http://localhost:18083
+- **Grafana**: http://localhost:3000
+- **Metrics**: http://localhost:8081
 
-- **Application**: Port 8081 (metrics)
-- **Grafana UI**: http://localhost:3000
-- **OTLP gRPC**: Port 4317
-- **OTLP HTTP**: Port 4318
+### Exercise it without hardware
 
-### Build and Run
+`mock-rcplus` simulates an RC Plus + M30T — onboarding, topology, and live OSD:
 
 ```bash
-go build -o go-start ./cmd/go-start
-./go-start
+docker compose --profile mock up        # includes the simulator
+# or run it against a running stack:
+go run ./cmd/mock-rcplus
 ```
 
-## Project Structure
+Then watch telemetry flow:
+
+```bash
+curl -H 'X-API-Key: dev-integration-key' http://localhost:8080/api/devices
+```
+
+### End-to-end test
+
+```bash
+make integration     # brings up the stack + mock, asserts telemetry is ingested
+```
+
+## Project structure
 
 ```
 .
-├── cmd/go-start/       # Application entrypoint
+├── cmd/
+│   ├── rescuestream-dji-bridge/  # bridge entrypoint
+│   └── mock-rcplus/              # RC Plus + M30T simulator
 ├── internal/
-│   ├── config/         # Environment-based configuration
-│   └── logging/        # Logging utilities
-├── docker/
-│   └── grafana/        # Grafana dashboard provisioning
-├── Dockerfile          # Multi-stage build
-└── docker-compose.yml  # Local development stack
+│   ├── config/  logging/         # configuration and logging
+│   ├── mqtt/                     # autopaho MQTT 5.0 client wrapper
+│   ├── cloudapi/                 # DJI Cloud API protocol layer
+│   │   ├── message/ topic/       # envelope, topic parsing + router
+│   │   ├── correlation/          # tid request/reply correlation
+│   │   ├── telemetry/            # OSD/state typed structs
+│   │   ├── live/                 # P2 live streaming (stub)
+│   │   └── drc/                  # P3 DRC control (stub)
+│   ├── device/                   # device registry + telemetry store
+│   ├── handler/                  # inbound topic handlers
+│   └── onboarding/               # HTTP server + JWT credential minting
+├── web/onboarding/               # JSBridge onboarding page
+├── docker/                       # EMQX certs, JWT keys, Grafana provisioning
+└── scripts/                      # integration test
 ```
 
 ## CI/CD
